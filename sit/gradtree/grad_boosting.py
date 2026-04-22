@@ -11,16 +11,45 @@ def sigmoid(t):
     return 1 / (1 + np.exp(-t))
 
 
+def _group_instance_outputs(values, mil_data):
+    """Convert flattened per-instance outputs back into one array per bag."""
+    grouped = []
+    for start, end in zip(mil_data.shifts[:-1], mil_data.shifts[1:]):
+        cur = values[start:end]
+        if cur.ndim == 2 and cur.shape[1] == 1:
+            cur = cur[:, 0]
+        grouped.append(cur)
+    return grouped
+
+
+def _configure_rank_loss(stnn, params, instance_y):
+    """Translate public hyperparameters into SetTreeNN rank-loss settings."""
+    rank_loss_weight = params.get('rank_loss_weight', params.get('lambda_rank', 0.0))
+    instance_loss_weight = params.get('instance_loss_weight', params.get('lambda_inst', 0.0))
+    rank_loss_margin = params.get('rank_loss_margin', params.get('rank_margin', 0.0))
+    if (rank_loss_weight or instance_loss_weight) and instance_y is None:
+        raise ValueError('instance_y is required when rank or instance loss is enabled')
+    if instance_y is not None or rank_loss_weight or instance_loss_weight:
+        stnn.set_rank_loss(
+            instance_labels=instance_y,
+            rank_loss_weight=rank_loss_weight,
+            rank_loss_margin=rank_loss_margin,
+            instance_loss_weight=instance_loss_weight,
+        )
+
+
 class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
     def __init__(self, **params):
         if 'loss_fn' not in params:
             params['loss_fn'] = 'bce'
         self.params = params
 
-    def fit(self, X, y, group_sizes):
-        mil_train = MILData(X, y, group_sizes)
+    def fit(self, X, y, group_sizes, instance_y=None):
+        mil_train = MILData(X, y, group_sizes, instance_y=instance_y)
         params = self.params
 
+        # Build the gradient-tree encoder and the neural bag aggregator, then
+        # optionally attach auxiliary rank supervision on attention logits.
         self.stnn = SetTreeNN(
             base_estimator=GradientGrowingTreeRegressor(
                 lam_2=params['lam_2'],
@@ -41,6 +70,7 @@ class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
          .set_dropout(params['dropout'])
         if 'loss_fn' in params:
             self.stnn.set_loss_fn(params['loss_fn'])
+        _configure_rank_loss(self.stnn, params, mil_train.instance_y)
 
         self.stnn.enable_postiter_nn = False
         self.stnn.fit(
@@ -59,15 +89,35 @@ class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
     def predict(self, X, group_sizes):
         return np.argmax(self.predict_proba(X, group_sizes), axis=1)
 
+    def predict_attention_logits(self, X, group_sizes, grouped: bool = True):
+        """Return raw attention logits, either flattened or grouped by bag."""
+        mil_data = MILData(X, None, group_sizes)
+        logits = self.stnn.predict_attention_logits(
+            X=mil_data.X,
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
+        return _group_instance_outputs(logits, mil_data) if grouped else logits
+
+    def predict_attention_weights(self, X, group_sizes, grouped: bool = True):
+        """Return post-softmax attention weights, either flattened or per bag."""
+        mil_data = MILData(X, None, group_sizes)
+        weights = self.stnn.predict_attention_weights(
+            X=mil_data.X,
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
+        return _group_instance_outputs(weights, mil_data) if grouped else weights
+
 
 class GradBoostingRegressor(RegressorMixin, BaseEstimator):
     def __init__(self, **params):
         self.params = params
 
-    def fit(self, X, y, group_sizes):
-        mil_train = MILData(X, y, group_sizes)
+    def fit(self, X, y, group_sizes, instance_y=None):
+        mil_train = MILData(X, y, group_sizes, instance_y=instance_y)
         params = self.params
 
+        # Same encoder/aggregator stack as the classifier, but with a
+        # regression bag loss on top instead of BCE.
         self.stnn = SetTreeNN(
             base_estimator=GradientGrowingTreeRegressor(
                 lam_2=params['lam_2'],
@@ -88,6 +138,7 @@ class GradBoostingRegressor(RegressorMixin, BaseEstimator):
          .set_dropout(params['dropout'])
         if 'loss_fn' in params:
             self.stnn.set_loss_fn(params['loss_fn'])
+        _configure_rank_loss(self.stnn, params, mil_train.instance_y)
 
         self.stnn.enable_postiter_nn = False
         self.stnn.fit(
@@ -101,3 +152,21 @@ class GradBoostingRegressor(RegressorMixin, BaseEstimator):
     def predict(self, X, group_sizes):
         mil_test = MILData(X, None, group_sizes)
         return self.stnn.predict(X=mil_test.X, X_nn=mil_test.group_ids.reshape((-1, 1))).numpy()
+
+    def predict_attention_logits(self, X, group_sizes, grouped: bool = True):
+        """Return raw attention logits, either flattened or grouped by bag."""
+        mil_data = MILData(X, None, group_sizes)
+        logits = self.stnn.predict_attention_logits(
+            X=mil_data.X,
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
+        return _group_instance_outputs(logits, mil_data) if grouped else logits
+
+    def predict_attention_weights(self, X, group_sizes, grouped: bool = True):
+        """Return post-softmax attention weights, either flattened or per bag."""
+        mil_data = MILData(X, None, group_sizes)
+        weights = self.stnn.predict_attention_weights(
+            X=mil_data.X,
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
+        return _group_instance_outputs(weights, mil_data) if grouped else weights

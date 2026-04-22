@@ -63,3 +63,34 @@ model = GradSITRegressor(
 model.fit(mil_data_train.X, mil_data_train.y, mil_data_train.group_sizes)
 predictions = model.predict(mil_data_test.X, mil_data_test.group_sizes)
 ```
+
+To rank raw pre-softmax attention logits with partial instance labels, pass `instance_y` with one value per instance
+(`1` for known positive, `0` for known negative, `np.nan` or any negative value for unknown)
+and set `lambda_rank`:
+
+```python
+model = GradBoostingClassifier(
+    lam_2=0.001,
+    lr=1.0,
+    max_depth=7,
+    splitter='random',
+    n_estimators=20,
+    n_update_iterations=1,
+    embedding_size=32,
+    nn_lr=1.e-4,
+    nn_num_heads=8,
+    nn_steps=1,
+    dropout=0.0,
+    lambda_rank=0.1,
+    rank_margin=0.0,
+    lambda_inst=0.0,
+)
+model.fit(
+    mil_data_train.X,
+    mil_data_train.y,
+    mil_data_train.group_sizes,
+    instance_y=instance_y_train,
+)
+bag_logits = model.predict_attention_logits(mil_data_train.X, mil_data_train.group_sizes)
+bag_weights = model.predict_attention_weights(mil_data_train.X, mil_data_train.group_sizes)
+```

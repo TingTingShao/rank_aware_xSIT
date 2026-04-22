@@ -20,13 +20,28 @@ def leaf_indices_into_bag_embeddings(leaf_ids, group_sizes, all_leaves=None, nor
     return embeddings[:, all_leaves], all_leaves
 
 
+def _configure_rank_loss(stnn, params, instance_y):
+    rank_loss_weight = params.get('rank_loss_weight', params.get('lambda_rank', 0.0))
+    instance_loss_weight = params.get('instance_loss_weight', params.get('lambda_inst', 0.0))
+    rank_loss_margin = params.get('rank_loss_margin', params.get('rank_margin', 0.0))
+    if (rank_loss_weight or instance_loss_weight) and instance_y is None:
+        raise ValueError('instance_y is required when rank or instance loss is enabled')
+    if instance_y is not None or rank_loss_weight or instance_loss_weight:
+        stnn.set_rank_loss(
+            instance_labels=instance_y,
+            rank_loss_weight=rank_loss_weight,
+            rank_loss_margin=rank_loss_margin,
+            instance_loss_weight=instance_loss_weight,
+        )
+
+
 class GradientSetInputTreeEmbedder(TransformerMixin, BaseEstimator):
     def __init__(self, grad_tree_params: dict):
         self.normalize = grad_tree_params.pop('normalize', True)
         self.grad_tree_params = grad_tree_params
 
-    def fit_transform(self, X, y, group_sizes):
-        mil_train = MILData(X, y, group_sizes)
+    def fit_transform(self, X, y, group_sizes, instance_y=None):
+        mil_train = MILData(X, y, group_sizes, instance_y=instance_y)
         params = self.grad_tree_params
 
         self.stnn = SetTreeNN(
@@ -49,6 +64,7 @@ class GradientSetInputTreeEmbedder(TransformerMixin, BaseEstimator):
          .set_dropout(params['dropout'])
         if 'loss_fn' in params:
             self.stnn.set_loss_fn(params['loss_fn'])
+        _configure_rank_loss(self.stnn, params, mil_train.instance_y)
 
         self.stnn.enable_postiter_nn = False
         self.stnn.fit(

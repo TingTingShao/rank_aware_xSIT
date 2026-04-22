@@ -19,6 +19,8 @@ class AttentionAggregationNN(torch.nn.Module):
         self.query = torch.nn.Parameter(torch.ones((1, 1, embed_dim), dtype=torch.float32, requires_grad=True))
         self.linear = torch.nn.Linear(embed_dim, out_features)
         self.group_ids = None
+        self.last_attention_logits = None
+        self.last_attention_weights = None
 
     def _recompute_group_cache(self, group_ids):
         if group_ids is self.group_ids:
@@ -39,22 +41,66 @@ class AttentionAggregationNN(torch.nn.Module):
         self.emplacement_ids = tuple(torch.argwhere(~self.kp_mask).T)
         self.instance_sorter = torch.argsort(group_ids)
 
+    def _raw_attention_logits(self, query, embs):
+        """Rebuild pre-softmax attention logits from the current Q/K projections.
+
+        PyTorch MultiheadAttention does not expose raw logits, only normalized
+        weights. We reconstruct them here so the ranking loss can supervise the
+        exact quantity used before softmax.
+        """
+        if not self.attention._qkv_same_embed_dim:
+            raise ValueError('Raw attention ranking expects query/key/value to share embed_dim')
+
+        q_weight, k_weight, _ = self.attention.in_proj_weight.chunk(3, dim=0)
+        if self.attention.in_proj_bias is None:
+            q_bias = k_bias = None
+        else:
+            q_bias, k_bias, _ = self.attention.in_proj_bias.chunk(3, dim=0)
+
+        q = torch.nn.functional.linear(query, q_weight, q_bias)
+        k = torch.nn.functional.linear(embs, k_weight, k_bias)
+        batch_size, target_len, embed_dim = q.shape
+        source_len = k.shape[1]
+        num_heads = self.attention.num_heads
+        head_dim = embed_dim // num_heads
+
+        q = q.reshape(batch_size, target_len, num_heads, head_dim).transpose(1, 2)
+        k = k.reshape(batch_size, source_len, num_heads, head_dim).transpose(1, 2)
+        logits = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
+        # We store one score per instance, so multi-head logits are averaged.
+        logits = logits.squeeze(2).mean(dim=1)
+        return logits
+
     def forward(self, tree_preds, group_ids):
         self._recompute_group_cache(group_ids)
         embed_dim = tree_preds.shape[1]
 
-        # Embeddings tensor should be constructed each time
+        # Pack flattened instance embeddings into a padded bag-major tensor.
         embs = torch.zeros(self.n_groups, self.max_group_size, embed_dim, dtype=tree_preds.dtype)
         embs[self.emplacement_ids] = tree_preds[self.instance_sorter]
+        query = self.query.expand(embs.shape[0], 1, embs.shape[2])
 
-        # print(self.query.shape, embs.shape, kp_mask.shape)
-        group_embeddings, *_ = self.attention(
-            self.query.expand(embs.shape[0], 1, embs.shape[2]),  # expand the batch dimension
+        # Keep raw logits in flattened instance order so ranking loss and
+        # downstream inspection use the same per-instance convention.
+        padded_attention_logits = self._raw_attention_logits(query, embs)
+        attention_logits = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
+        attention_logits[self.instance_sorter] = padded_attention_logits[self.emplacement_ids].reshape((-1, 1))
+        self.last_attention_logits = attention_logits
+
+        group_embeddings, attention_weights = self.attention(
+            query,
             embs,
             embs,
             key_padding_mask=self.kp_mask,
             is_causal=False,
         )
+
+        # Store normalized attention weights in the same flattened order as the
+        # original instances. This makes inference-time inspection easy.
+        attention_weights = attention_weights.squeeze(1)
+        flat_attention_weights = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
+        flat_attention_weights[self.instance_sorter] = attention_weights[self.emplacement_ids].reshape((-1, 1))
+        self.last_attention_weights = flat_attention_weights
         group_embeddings = group_embeddings.squeeze(1)
         return self.linear(group_embeddings)
 
@@ -69,6 +115,11 @@ class SetTreeNN(TreeNN):
         self.dropout = 0.0
         self.random_state = 1
         self.loss_fn = 'se'
+        self.rank_loss_weight = 0.0
+        self.rank_loss_margin = 0.0
+        self.instance_loss_weight = 0.0
+        self.instance_labels = None
+        self.instance_labels_torch_ = None
         torch.manual_seed(self.random_state)
         self.metrics = {
             'r2': r2_score,
@@ -106,6 +157,19 @@ class SetTreeNN(TreeNN):
         self.loss_fn = loss_fn
         return self
 
+    def set_rank_loss(self, instance_labels=None, rank_loss_weight: float = 0.0,
+                      rank_loss_margin: float = 0.0, instance_loss_weight: float = 0.0):
+        self.rank_loss_weight = rank_loss_weight
+        self.rank_loss_margin = rank_loss_margin
+        self.instance_loss_weight = instance_loss_weight
+        if instance_labels is not None:
+            self.set_instance_labels(instance_labels)
+        return self
+
+    def set_instance_labels(self, instance_labels):
+        self.instance_labels = instance_labels
+        return self
+
     def set_make_nn(self, make_nn):
         self.make_nn = make_nn
 
@@ -139,24 +203,139 @@ class SetTreeNN(TreeNN):
         self.n_outputs_ = y_torch.shape[1]
         self.nn_ = self.make_nn().to(torch.float64)
         self.optim_ = torch.optim.AdamW(self.nn_.parameters(), lr=self.nn_lr)
+        if self.instance_labels is not None:
+            self.instance_labels_torch_ = torch.as_tensor(
+                self.instance_labels,
+                dtype=y_torch.dtype,
+            )
+        else:
+            self.instance_labels_torch_ = None
 
     def _predict_nn(self, cur_X_torch, cur_trees_predictions_torch):
         return self.nn_(cur_trees_predictions_torch, group_ids=cur_X_torch)
 
+    def _predict_attention_outputs(self, cur_X_torch, cur_trees_predictions_torch):
+        """Run a forward pass and return the cached per-instance attention data."""
+        with torch.inference_mode():
+            self._predict_nn(cur_X_torch, cur_trees_predictions_torch)
+            return (
+                self.nn_.last_attention_logits.detach().clone(),
+                self.nn_.last_attention_weights.detach().clone(),
+            )
+
+    def predict_attention_logits(self, X, X_nn):
+        """Return flattened raw attention logits for the provided MIL batch."""
+        with torch.inference_mode():
+            self.predict(X=X, X_nn=X_nn)
+            return self.nn_.last_attention_logits.detach().clone()
+
+    def predict_attention_weights(self, X, X_nn):
+        """Return flattened post-softmax attention weights for the MIL batch."""
+        with torch.inference_mode():
+            self.predict(X=X, X_nn=X_nn)
+            return self.nn_.last_attention_weights.detach().clone()
+
+    def __aligned_instance_labels(self, scores, cur_X_torch):
+        if self.instance_labels_torch_ is None:
+            return None
+        if len(self.instance_labels_torch_) != len(cur_X_torch):
+            return None
+
+        labels = self.instance_labels_torch_.to(device=scores.device, dtype=scores.dtype)
+        if labels.ndim == 1:
+            labels = labels.reshape((-1, 1))
+        if labels.shape[1] == 1 and scores.shape[1] != 1:
+            labels = labels.expand((-1, scores.shape[1]))
+        if labels.shape != scores.shape:
+            raise ValueError(
+                f'instance_labels shape {tuple(labels.shape)} is incompatible with '
+                f'attention logits shape {tuple(scores.shape)}'
+            )
+        return labels
+
+    @staticmethod
+    def __valid_instance_label_mask(labels):
+        return torch.isfinite(labels) & (labels >= 0.0)
+
+    def __rank_loss(self, cur_X_torch):
+        """Pairwise rank loss on raw attention logits inside each bag.
+
+        Only annotated positive-negative pairs contribute. Within each bag we
+        average over available pairs so a densely annotated bag does not
+        dominate the ranking signal.
+        """
+        scores = getattr(self.nn_, 'last_attention_logits', None)
+        if scores is None:
+            return None
+        labels = self.__aligned_instance_labels(scores, cur_X_torch)
+        if labels is None:
+            return None
+
+        group_ids = cur_X_torch.ravel().to(device=scores.device, dtype=torch.long)
+        losses = []
+        for gid in torch.unique(group_ids):
+            group_mask = group_ids == gid
+            group_scores = scores[group_mask]
+            group_labels = labels[group_mask]
+            valid_labels = self.__valid_instance_label_mask(group_labels)
+            for output_id in range(group_scores.shape[1]):
+                output_valid = valid_labels[:, output_id]
+                output_labels = group_labels[:, output_id]
+                pos_scores = group_scores[output_valid & (output_labels > 0.5), output_id]
+                neg_scores = group_scores[output_valid & (output_labels <= 0.5), output_id]
+                if len(pos_scores) == 0 or len(neg_scores) == 0:
+                    continue
+                diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
+                losses.append(torch.nn.functional.softplus(-diffs).mean())
+        if len(losses) == 0:
+            return scores.new_zeros(())
+        return torch.stack(losses).sum()
+
+    def __instance_loss(self, cur_X_torch):
+        scores = getattr(self.nn_, 'last_attention_logits', None)
+        if scores is None:
+            return None
+        labels = self.__aligned_instance_labels(scores, cur_X_torch)
+        if labels is None:
+            return None
+
+        valid_labels = self.__valid_instance_label_mask(labels)
+        if not torch.any(valid_labels):
+            return scores.new_zeros(())
+        return torch.nn.functional.binary_cross_entropy_with_logits(
+            scores[valid_labels],
+            labels[valid_labels],
+            reduction='sum',
+        )
+
+    def __add_auxiliary_losses(self, bag_loss, cur_X_torch):
+        """Attach optional rank / instance supervision to the bag loss."""
+        loss = bag_loss
+        if self.rank_loss_weight:
+            rank_loss = self.__rank_loss(cur_X_torch)
+            if rank_loss is not None:
+                loss = loss + self.rank_loss_weight * rank_loss
+        if self.instance_loss_weight:
+            instance_loss = self.__instance_loss(cur_X_torch)
+            if instance_loss is not None:
+                loss = loss + self.instance_loss_weight * instance_loss
+        return loss
+
     def __loss_fn(self, cur_X_torch, cur_y_torch, nn_preds):
         # group_ids = cur_X_torch
         if callable(self.loss_fn):
-            return self.loss_fn(nn_preds, cur_y_torch)
+            bag_loss = self.loss_fn(nn_preds, cur_y_torch)
         elif self.loss_fn.lower() == 'se':
-            return (cur_y_torch - nn_preds).pow(2).sum()
+            bag_loss = (cur_y_torch - nn_preds).pow(2).sum()
         elif self.loss_fn.lower() == 'bce':
-            return torch.nn.functional.binary_cross_entropy_with_logits(
+            bag_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 nn_preds,
                 cur_y_torch,
                 reduction='sum'
             )
         else:
             raise ValueError(f'Wrong {self.loss_fn=!r}')
+        return self.__add_auxiliary_losses(bag_loss, cur_X_torch)
 
     def _post_update_nn(self, X_nn_torch, y_torch, sample_ids_torch, cumulative_predictions):
         for _ in range(self.nn_steps):

@@ -31,10 +31,10 @@ class GradSITClassifier(ClassifierMixin, BaseEstimator):
         ], axis=0)
         return group_X
 
-    def fit(self, X, y, group_sizes):
-        data = MILData(X, y, group_sizes)
+    def fit(self, X, y, group_sizes, instance_y=None):
+        data = MILData(X, y, group_sizes, instance_y=instance_y)
         self.embedder = GradientSetInputTreeEmbedder(self.params)
-        emb_train = self.embedder.fit_transform(X, y, group_sizes)
+        emb_train = self.embedder.fit_transform(X, y, group_sizes, instance_y=instance_y)
 
         self.bag_gbm = clone(self.base_clf)
 
@@ -76,8 +76,8 @@ class GradSetForestClassifier(ClassifierMixin, BaseEstimator):
         self.params = params
         self.random_state = random_state
 
-    def fit(self, X, y, group_sizes):
-        data = MILData(X, y, group_sizes)
+    def fit(self, X, y, group_sizes, instance_y=None):
+        data = MILData(X, y, group_sizes, instance_y=instance_y)
         rng = check_random_state(self.random_state)
         seeds = rng.randint(0, np.iinfo(np.int32).max, size=self.n_estimators)
         fake_bagging = BaggingRegressor(
@@ -99,7 +99,12 @@ class GradSetForestClassifier(ClassifierMixin, BaseEstimator):
                 random_state=seeds[i],
             )
             cur = data[fake_bagging.estimators_samples_[i]]
-            model.fit(cur.X[:, self.estimators_features_[i]], cur.y, cur.group_sizes)
+            model.fit(
+                cur.X[:, self.estimators_features_[i]],
+                cur.y,
+                cur.group_sizes,
+                instance_y=cur.instance_y,
+            )
             self.estimators_.append(model)
         return self
 
