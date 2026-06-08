@@ -4,6 +4,7 @@ from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.utils.validation import check_random_state
 from gradient_growing_trees.tree import GradientGrowingTreeRegressor
 from .set_tree_nn import SetTreeNN
+from .embedder import leaf_indices_into_bag_embeddings
 from ..mil.data import MILData
 
 
@@ -36,6 +37,15 @@ def _configure_rank_loss(stnn, params, instance_y):
             rank_loss_margin=rank_loss_margin,
             instance_loss_weight=instance_loss_weight,
         )
+
+
+def _get_tree_estimator(stnn, tree_idx: int):
+    """Return one fitted gradient tree by index."""
+    if not hasattr(stnn, 'estimators_'):
+        raise ValueError('The model is not fitted yet.')
+    if tree_idx < 0 or tree_idx >= len(stnn.estimators_):
+        raise IndexError(f'tree_idx={tree_idx} is out of range for {len(stnn.estimators_)} fitted trees')
+    return stnn.estimators_[tree_idx]
 
 
 class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
@@ -107,6 +117,41 @@ class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
         ).numpy()
         return _group_instance_outputs(weights, mil_data) if grouped else weights
 
+    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True):
+        """Return the dense per-instance tree embeddings used by attention."""
+        mil_data = MILData(X, None, group_sizes)
+        embeddings = self.stnn.predict_instance_embeddings(
+            X=mil_data.X,
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
+        return _group_instance_outputs(embeddings, mil_data) if grouped else embeddings
+
+    def get_tree_estimator(self, tree_idx: int = 0):
+        """Expose one fitted tree so its raw attributes can be inspected."""
+        return _get_tree_estimator(self.stnn, tree_idx)
+
+    def predict_leaf_indices(self, X, group_sizes, tree_idx: int = 0, grouped: bool = True):
+        """Return the leaf id reached by each instance for one fitted tree."""
+        mil_data = MILData(X, None, group_sizes)
+        leaf_ids = _get_tree_estimator(self.stnn, tree_idx).apply(mil_data.X)
+        return _group_instance_outputs(leaf_ids, mil_data) if grouped else leaf_ids
+
+    def predict_leaf_bag_embeddings(self, X, group_sizes, tree_idx: int = 0, normalize: bool = True):
+        """Return bag-level leaf-count embeddings for one fitted tree.
+
+        Each column corresponds to a leaf reached by at least one instance in the
+        input data. With normalize=True, counts are divided by bag size.
+        """
+        mil_data = MILData(X, None, group_sizes)
+        leaf_ids = _get_tree_estimator(self.stnn, tree_idx).apply(mil_data.X)
+        bag_embeddings, all_leaves = leaf_indices_into_bag_embeddings(
+            leaf_ids,
+            mil_data.group_sizes,
+            all_leaves=None,
+            normalize=normalize,
+        )
+        return bag_embeddings, all_leaves
+
 
 class GradBoostingRegressor(RegressorMixin, BaseEstimator):
     def __init__(self, **params):
@@ -170,3 +215,34 @@ class GradBoostingRegressor(RegressorMixin, BaseEstimator):
             X_nn=mil_data.group_ids.reshape((-1, 1)),
         ).numpy()
         return _group_instance_outputs(weights, mil_data) if grouped else weights
+
+    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True):
+        """Return the dense per-instance tree embeddings used by attention."""
+        mil_data = MILData(X, None, group_sizes)
+        embeddings = self.stnn.predict_instance_embeddings(
+            X=mil_data.X,
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
+        return _group_instance_outputs(embeddings, mil_data) if grouped else embeddings
+
+    def get_tree_estimator(self, tree_idx: int = 0):
+        """Expose one fitted tree so its raw attributes can be inspected."""
+        return _get_tree_estimator(self.stnn, tree_idx)
+
+    def predict_leaf_indices(self, X, group_sizes, tree_idx: int = 0, grouped: bool = True):
+        """Return the leaf id reached by each instance for one fitted tree."""
+        mil_data = MILData(X, None, group_sizes)
+        leaf_ids = _get_tree_estimator(self.stnn, tree_idx).apply(mil_data.X)
+        return _group_instance_outputs(leaf_ids, mil_data) if grouped else leaf_ids
+
+    def predict_leaf_bag_embeddings(self, X, group_sizes, tree_idx: int = 0, normalize: bool = True):
+        """Return bag-level leaf-count embeddings for one fitted tree."""
+        mil_data = MILData(X, None, group_sizes)
+        leaf_ids = _get_tree_estimator(self.stnn, tree_idx).apply(mil_data.X)
+        bag_embeddings, all_leaves = leaf_indices_into_bag_embeddings(
+            leaf_ids,
+            mil_data.group_sizes,
+            all_leaves=None,
+            normalize=normalize,
+        )
+        return bag_embeddings, all_leaves

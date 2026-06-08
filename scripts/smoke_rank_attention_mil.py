@@ -51,13 +51,13 @@ def main():
     model = GradBoostingClassifier(
         lam_2=0.001,
         lr=1.0,
-        max_depth=2,
+        max_depth=1,
         splitter="random",
-        n_estimators=2, 
+        n_estimators=1, 
         n_update_iterations=1,
-        embedding_size=8,
+        embedding_size=4,
         nn_lr=1e-4,
-        nn_num_heads=4,
+        nn_num_heads=1,
         nn_steps=1,
         dropout=0.0,
         lambda_rank=0.1,
@@ -66,7 +66,24 @@ def main():
     )
 
     model.fit(X, y, group_sizes, instance_y=instance_y)
-    proba = model.predict_proba(X, group_sizes)
+
+    # This is the dense per-instance tree embedding consumed by attention in the
+    # current GradBoostingClassifier pathway. Its last dimension should match
+    # embedding_size regardless of tree depth.
+    instance_embeddings = model.predict_instance_embeddings(X, group_sizes)
+    print(type(instance_embeddings))          
+    print(len(instance_embeddings))           
+
+    print(type(instance_embeddings[0]))      
+    print(instance_embeddings[0].shape)       
+    print(instance_embeddings[1].shape)       
+    print(instance_embeddings[1])     
+    print(instance_embeddings[0].dtype)       
+    print(instance_embeddings[0].ndim)        
+    print(instance_embeddings[0].size)        
+    # This is a different inspection view: a bag-level histogram over visited
+    # leaves for one tree. It is useful for understanding routing, but it is
+    # not the dense embedding used by attention.
 
 if __name__ == "__main__":
     main()

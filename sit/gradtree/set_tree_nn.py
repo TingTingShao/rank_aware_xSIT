@@ -16,9 +16,12 @@ class AttentionAggregationNN(torch.nn.Module):
             dropout=dropout,
             batch_first=True,
         )
+
+        # query is a learnable parameter that is used to compute the attention logits
         self.query = torch.nn.Parameter(torch.ones((1, 1, embed_dim), dtype=torch.float32, requires_grad=True))
         self.linear = torch.nn.Linear(embed_dim, out_features)
         self.group_ids = None
+        self.last_instance_embeddings = None
         self.last_attention_logits = None
         self.last_attention_weights = None
 
@@ -42,7 +45,8 @@ class AttentionAggregationNN(torch.nn.Module):
         self.instance_sorter = torch.argsort(group_ids)
 
     def _raw_attention_logits(self, query, embs):
-        """Rebuild pre-softmax attention logits from the current Q/K projections.
+        """
+        Rebuild pre-softmax attention logits from the current Q/K projections.
 
         PyTorch MultiheadAttention does not expose raw logits, only normalized
         weights. We reconstruct them here so the ranking loss can supervise the
@@ -58,7 +62,9 @@ class AttentionAggregationNN(torch.nn.Module):
             q_bias, k_bias, _ = self.attention.in_proj_bias.chunk(3, dim=0)
 
         q = torch.nn.functional.linear(query, q_weight, q_bias)
+        # print(q.shape)
         k = torch.nn.functional.linear(embs, k_weight, k_bias)
+        # print(k.shape)
         batch_size, target_len, embed_dim = q.shape
         source_len = k.shape[1]
         num_heads = self.attention.num_heads
@@ -67,13 +73,16 @@ class AttentionAggregationNN(torch.nn.Module):
         q = q.reshape(batch_size, target_len, num_heads, head_dim).transpose(1, 2)
         k = k.reshape(batch_size, source_len, num_heads, head_dim).transpose(1, 2)
         logits = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
-        # We store one score per instance, so multi-head logits are averaged.
+        # store one score per instance, so multi-head logits are averaged.
         logits = logits.squeeze(2).mean(dim=1)
         return logits
 
     def forward(self, tree_preds, group_ids):
         self._recompute_group_cache(group_ids)
         embed_dim = tree_preds.shape[1]
+        # Cache the dense tree embeddings that are actually consumed by the
+        # attention layer in the current GradBoostingClassifier pathway.
+        self.last_instance_embeddings = tree_preds.detach().clone()
 
         # Pack flattened instance embeddings into a padded bag-major tensor.
         embs = torch.zeros(self.n_groups, self.max_group_size, embed_dim, dtype=tree_preds.dtype)
@@ -103,7 +112,6 @@ class AttentionAggregationNN(torch.nn.Module):
         self.last_attention_weights = flat_attention_weights
         group_embeddings = group_embeddings.squeeze(1)
         return self.linear(group_embeddings)
-
 
 class SetTreeNN(TreeNN):
     def __post_init__(self):
@@ -219,9 +227,16 @@ class SetTreeNN(TreeNN):
         with torch.inference_mode():
             self._predict_nn(cur_X_torch, cur_trees_predictions_torch)
             return (
+                self.nn_.last_instance_embeddings.detach().clone(),
                 self.nn_.last_attention_logits.detach().clone(),
                 self.nn_.last_attention_weights.detach().clone(),
             )
+
+    def predict_instance_embeddings(self, X, X_nn):
+        """Return flattened dense per-instance tree embeddings used by attention."""
+        with torch.inference_mode():
+            self.predict(X=X, X_nn=X_nn)
+            return self.nn_.last_instance_embeddings.detach().clone()
 
     def predict_attention_logits(self, X, X_nn):
         """Return flattened raw attention logits for the provided MIL batch."""
@@ -281,12 +296,42 @@ class SetTreeNN(TreeNN):
             for output_id in range(group_scores.shape[1]):
                 output_valid = valid_labels[:, output_id]
                 output_labels = group_labels[:, output_id]
+                # embryo label [0, 1] -> 0: negative, 1: positive, inbetween: soft label when the number of embryos transferred (n) is smaller than the number of live birth (m) m/n
+                # output_label: calssifies the embryos with soft labels as negative !!!!
+                # "improvement": make use of the soft labels 
                 pos_scores = group_scores[output_valid & (output_labels > 0.5), output_id]
                 neg_scores = group_scores[output_valid & (output_labels <= 0.5), output_id]
+
                 if len(pos_scores) == 0 or len(neg_scores) == 0:
                     continue
+                # panelize cases where positive attention logits are not higher than negative attention logist by a margin
                 diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
                 losses.append(torch.nn.functional.softplus(-diffs).mean())
+
+                # example
+                # label 1.0 should rank above label 0.67
+                # label 0.67 should rank above label 0.33
+                # label 0.33 should rank above label 0.0
+                # valid_scores=group_scores[output_valid, output_id]
+                # valid_y=output_labels[output_valid]
+
+                # # pairwise label difference 
+                # label_diff=valid_y[:, None] - valid_y[None, :]
+
+                # # embryo i should rank above embryo j if lable_i > label_j
+                # pair_mask=label_diff>0
+
+                # if pair_mask.sum()==0:
+                #     continue 
+
+                # score_diff=valid_scores[:, None] - valid_scores[None, :]
+
+                # diffs=score_diff[pair_mask]-self.rank_loss_margin
+
+                # pair_losses=torch.nn.functional.softplus(-diffs)
+
+                # losses.append(pair_losses.mean())
+
         if len(losses) == 0:
             return scores.new_zeros(())
         return torch.stack(losses).sum()
@@ -302,6 +347,8 @@ class SetTreeNN(TreeNN):
         valid_labels = self.__valid_instance_label_mask(labels)
         if not torch.any(valid_labels):
             return scores.new_zeros(())
+        
+        # annotated positive instances should have high raw attnetion logits, annotated negative instances should have low raw attention logits 
         return torch.nn.functional.binary_cross_entropy_with_logits(
             scores[valid_labels],
             labels[valid_labels],
