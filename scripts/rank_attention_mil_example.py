@@ -101,8 +101,8 @@ def make_mil_arrays_from_dataframe(
     df_sorted : pd.DataFrame
         Sorted dataframe aligned with X and instance_y.
     """
-    features = CYCLE_FEATURES + DAY3_FEATURES + DAY56_FEATURES
-    # features = CYCLE_FEATURES + DAY56_FEATURES
+    # features = CYCLE_FEATURES + DAY3_FEATURES + DAY56_FEATURES
+    features = CYCLE_FEATURES + DAY56_FEATURES
     # features = DAY3_FEATURES + DAY56_FEATURES
 
     required_cols = [
@@ -181,7 +181,7 @@ def make_model():
         # instances in the same bag.
         # lambda_rank=0.5,
         lambda_rank=0,
-        rank_margin=0.0,
+        # rank_margin=0.0,
         # Optional pointwise supervision on the same raw attention logits.
         # lambda_inst=0.1,
         lambda_inst=0.0,
@@ -306,10 +306,10 @@ def main():
     # rankings["bag_probability_0"] = np.repeat(bag_probs[:, 0], group_sizes_te)
     rankings["bag_probability_1"] = np.repeat(bag_probs[:, 1], group_sizes_te)
     rankings["bag_livebirth_probability"] = rankings["bag_probability_1"]
-    rankings.to_csv(os.path.join(path, "test_attention_rankings_corrected_norankingloss.csv"), index=False)
+    rankings.to_csv(os.path.join(path, "test_attention_rankings_corrected_norankingloss_day56.csv"), index=False)
     # model.save(os.path.join(path, "rank_attention_mil_model_corrected.pkl"))
     # pickle save model 
-    with open(os.path.join(path, "rank_attention_mil_model_corrected_norankingloss.pkl"), 'wb') as file:
+    with open(os.path.join(path, "rank_attention_mil_model_corrected_remove_norankingloss_day56.pkl"), 'wb') as file:
         cloudpickle.dump(model, file)
     print(rankings.head(20))
 
