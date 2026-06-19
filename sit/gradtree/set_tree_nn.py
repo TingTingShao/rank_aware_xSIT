@@ -8,8 +8,12 @@ from abc import ABCMeta, abstractmethod
 
 
 class AttentionAggregationNN(torch.nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, out_features: int = 1):
+
+    # add the bag feature dim
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, out_features: int = 1, bag_feature_dim: int = 0):
         super().__init__()
+        self.bag_feature_dim = bag_feature_dim
+
         self.attention = torch.nn.MultiheadAttention(
             embed_dim,
             num_heads,
@@ -19,11 +23,19 @@ class AttentionAggregationNN(torch.nn.Module):
 
         # query is a learnable parameter that is used to compute the attention logits
         self.query = torch.nn.Parameter(torch.ones((1, 1, embed_dim), dtype=torch.float32, requires_grad=True))
-        self.linear = torch.nn.Linear(embed_dim, out_features)
+
+        # a linear head -> final prediction of the model
+
+        # embed_dim + bag feature dim: input feature dim of the linear layer
+        # out_features: output feature dim of the linear layer, one dim for the linear head to generate the final prediction
+        self.linear=torch.nn.Linear(embed_dim+bag_feature_dim, out_features)
+        # self.linear = torch.nn.Linear(embed_dim, out_features)
+
         self.group_ids = None
         self.last_instance_embeddings = None
         self.last_attention_logits = None
         self.last_attention_weights = None
+        self.last_group_embeddings = None
 
     def _recompute_group_cache(self, group_ids):
         if group_ids is self.group_ids:
@@ -37,7 +49,19 @@ class AttentionAggregationNN(torch.nn.Module):
         self.n_groups = len(unique_group_ids)
         self.max_group_size = torch.max(group_sizes)
 
-        self.kp_mask = torch.zeros(self.n_groups, self.max_group_size, dtype=torch.bool)  # this mask can also be prefilled
+        # this is to mark valid instance positions inside each bag/group
+        # [number of groups, maximum number of instances per group]
+        # example
+        # bag 0 has 3 embryos
+        # bag 1 has 1 embryo
+        # bag 2 has 4 embryos
+#      tensor([
+#     [False, False, False, False],
+#     [False, False, False, False],
+#     [False, False, False, False]
+# ])
+        self.kp_mask = torch.zeros(self.n_groups, self.max_group_size, dtype=torch.bool, device=group_ids.device)  # this mask can also be prefilled
+
         for gid, gs in zip(unique_group_ids, group_sizes):
             # embs[gid, :gs] = tree_preds[group_ids == gid]
             self.kp_mask[gid, gs:] = True
@@ -77,22 +101,81 @@ class AttentionAggregationNN(torch.nn.Module):
         logits = logits.squeeze(2).mean(dim=1)
         return logits
 
-    def forward(self, tree_preds, group_ids):
+    def _split_group_context(self, group_context):
+        if group_context.ndim==1 or group_context.shape[1]==1:
+            return group_context.reshape((-1, 1)), None
+        
+        group_ids=group_context[:, :1]
+        repeated_bag_features = group_context[:, 1:]
+        return group_ids, repeated_bag_features
+    
+    def _bag_features_by_group(self, group_ids, repeated_bag_features):
+        if repeated_bag_features is None:
+            if self.bag_features_dim: 
+                raise ValueError("Bag features are required for this model")
+            return None
+
+        if repeated_bag_features.shape[1]!=self.bag_feature_dim:
+            raise ValueError("Bag features must have dimension %d, got %d" % (self.bag_feature_dim, repeated_bag_features.shape[1]))
+        
+        flat_group_ids=group_ids.ravel().to(torch.long)
+        unique_group_ids=torch.unique(flat_group_ids, sorted=True)
+
+        expected_group_ids=torch.arange(
+            len(unique_group_ids),
+            device=flat_group_ids.device,
+            dtype=flat_group_ids.dtype,
+        )
+
+        if not torch.equal(unique_group_ids, expected_group_ids):
+            raise ValueError("Group ids must be contiguous integers starting from 0")
+        
+        bag_features=[]
+        for grid in unique_group_ids:
+            cur=repeated_bag_features[flat_group_ids==grid]
+
+            if cur.shape[0]==0:
+                raise ValueError("Group %d has no instances" % grid)
+
+            if not torch.allclose(cur, cur[:1].expand_as(cur), equal_nan=True):
+                raise ValueError("Group %d has inconsistent bag features" % grid)
+
+            bag_features.append(cur[0])
+        
+        return torch.stack(bag_features, dim=0)
+
+
+    
+    def forward(self, tree_preds, group_context):
+
+        group_ids, repeated_bag_features=self._split_group_context(group_context)
         self._recompute_group_cache(group_ids)
+
         embed_dim = tree_preds.shape[1]
         # Cache the dense tree embeddings that are actually consumed by the
         # attention layer in the current GradBoostingClassifier pathway.
         self.last_instance_embeddings = tree_preds.detach().clone()
 
         # Pack flattened instance embeddings into a padded bag-major tensor.
-        embs = torch.zeros(self.n_groups, self.max_group_size, embed_dim, dtype=tree_preds.dtype)
+        embs = torch.zeros(
+            self.n_groups, 
+            self.max_group_size, 
+            embed_dim, 
+            dtype=tree_preds.dtype,
+            device=tree_preds.device)
+
         embs[self.emplacement_ids] = tree_preds[self.instance_sorter]
         query = self.query.expand(embs.shape[0], 1, embs.shape[2])
 
         # Keep raw logits in flattened instance order so ranking loss and
         # downstream inspection use the same per-instance convention.
         padded_attention_logits = self._raw_attention_logits(query, embs)
-        attention_logits = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
+        attention_logits = torch.empty(
+            len(tree_preds), 
+            1, 
+            dtype=tree_preds.dtype, 
+            device=tree_preds.device)
+
         attention_logits[self.instance_sorter] = padded_attention_logits[self.emplacement_ids].reshape((-1, 1))
         self.last_attention_logits = attention_logits
 
@@ -107,10 +190,23 @@ class AttentionAggregationNN(torch.nn.Module):
         # Store normalized attention weights in the same flattened order as the
         # original instances. This makes inference-time inspection easy.
         attention_weights = attention_weights.squeeze(1)
-        flat_attention_weights = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
+        flat_attention_weights = torch.empty(
+            len(tree_preds), 
+            1, 
+            dtype=tree_preds.dtype, 
+            device=tree_preds.device)
+
         flat_attention_weights[self.instance_sorter] = attention_weights[self.emplacement_ids].reshape((-1, 1))
         self.last_attention_weights = flat_attention_weights
+
         group_embeddings = group_embeddings.squeeze(1)
+        self.last_group_embedding=group_embeddings.detach().clone()
+
+        bag_features=self._bag_features_by_group(group_ids, repeated_bag_features)
+
+        if bag_features is not None:
+            group_embeddings = torch.cat([group_embeddings, bag_features], dim=1)
+
         return self.linear(group_embeddings)
 
 class SetTreeNN(TreeNN):
@@ -179,7 +275,20 @@ class SetTreeNN(TreeNN):
         return self
 
     def set_make_nn(self, make_nn):
-        self.make_nn = make_nn
+        # self.make_nn = make_nn
+        self.make_nn=lambda: (
+            AttentionAggregationNN(
+                embed_dim=self.embedding_size, 
+                num_heads=self.nn_num_heads,
+                dropout=self.dropout,
+                out_features=self.n_outputs_,
+                bag_feature_dim=self.bag_feature_dim,
+            )
+        )
+    
+    def set_bag_feature_dim(self, bag_feature_dim:int):
+        self.bag_feature_dim=bag_feature_dim
+        return self
 
     def _postiter_nn(self, X_torch, y_torch, cumulative_predictions,
                      eval_X_nn=None,
@@ -305,32 +414,32 @@ class SetTreeNN(TreeNN):
                 if len(pos_scores) == 0 or len(neg_scores) == 0:
                     continue
                 # panelize cases where positive attention logits are not higher than negative attention logist by a margin
-                diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
-                losses.append(torch.nn.functional.softplus(-diffs).mean())
+                # diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
+                # losses.append(torch.nn.functional.softplus(-diffs).mean())
 
                 # example
                 # label 1.0 should rank above label 0.67
                 # label 0.67 should rank above label 0.33
                 # label 0.33 should rank above label 0.0
-                # valid_scores=group_scores[output_valid, output_id]
-                # valid_y=output_labels[output_valid]
+                valid_scores=group_scores[output_valid, output_id]
+                valid_y=output_labels[output_valid]
 
                 # # pairwise label difference 
-                # label_diff=valid_y[:, None] - valid_y[None, :]
+                label_diff=valid_y[:, None] - valid_y[None, :]
 
                 # # embryo i should rank above embryo j if lable_i > label_j
-                # pair_mask=label_diff>0
+                pair_mask=label_diff>0
 
-                # if pair_mask.sum()==0:
-                #     continue 
+                if pair_mask.sum()==0:
+                    continue 
 
-                # score_diff=valid_scores[:, None] - valid_scores[None, :]
+                score_diff=valid_scores[:, None] - valid_scores[None, :]
 
-                # diffs=score_diff[pair_mask]-self.rank_loss_margin
+                diffs=score_diff[pair_mask]-self.rank_loss_margin
 
-                # pair_losses=torch.nn.functional.softplus(-diffs)
+                pair_losses=torch.nn.functional.softplus(-diffs)
 
-                # losses.append(pair_losses.mean())
+                losses.append(pair_losses.mean())
 
         if len(losses) == 0:
             return scores.new_zeros(())

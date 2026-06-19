@@ -47,6 +47,28 @@ def _get_tree_estimator(stnn, tree_idx: int):
         raise IndexError(f'tree_idx={tree_idx} is out of range for {len(stnn.estimators_)} fitted trees')
     return stnn.estimators_[tree_idx]
 
+def _validate_bag_X(bag_X, group_sizes):
+    if bag_X is None:
+        return None
+    
+    if bag_X.ndim==1:
+        bag_X=bag_X.reshape(-1, 1)
+    
+    if bag_X.ndim!=2:
+        raise ValueError('bag_X must be 1D or 2D')
+    if bag_X.shape[0] != len(group_sizes):
+        raise ValueError('bag_X must have the same number of rows as group_sizes')
+    return bag_X
+
+def _make_group_context(mil_data, bag_X=None):
+    group_ids=mil_data.group_ids.reshape(-1, 1)
+    bag_X=_validate_bag_X(bag_X, mil_data.group_sizes)
+    if bag_X is None:
+        return group_ids
+    
+    repeated_bag_X=np.repeat(bag_X, mil_data.group_sizes, axis=0)
+    return np.concatenate([group_ids, repeated_bag_X], axis=1)
+
 
 class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
     def __init__(self, **params):
@@ -54,9 +76,12 @@ class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
             params['loss_fn'] = 'bce'
         self.params = params
 
-    def fit(self, X, y, group_sizes, instance_y=None):
+    def fit(self, X, y, group_sizes, instance_y=None, bag_X=None):
         mil_train = MILData(X, y, group_sizes, instance_y=instance_y)
         params = self.params
+
+        bag_X=_validate_bag_X(bag_X, mil_train.group_sizes)
+        bag_feature_dim=0 if bag_X is None else bag_X.shape[1]
 
         # Build the gradient-tree encoder and the neural bag aggregator, then
         # optionally attach auxiliary rank supervision on attention logits.
@@ -77,16 +102,20 @@ class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
          .set_nn_lr(params['nn_lr'])\
          .set_nn_num_heads(params['nn_num_heads'])\
          .set_nn_steps(params['nn_steps'])\
-         .set_dropout(params['dropout'])
+         .set_dropout(params['dropout'])\
+         .set_bag_feature_dim(bag_feature_dim) # add bag feature dim
+
         if 'loss_fn' in params:
             self.stnn.set_loss_fn(params['loss_fn'])
+
         _configure_rank_loss(self.stnn, params, mil_train.instance_y)
 
         self.stnn.enable_postiter_nn = False
         self.stnn.fit(
             mil_train.X,
             mil_train.y.reshape((-1, 1)) if mil_train.y.ndim == 1 else mil_train.y,
-            X_nn=mil_train.group_ids.reshape((-1, 1)),
+            # X_nn=mil_train.group_ids.reshape((-1, 1)),
+            X_nn=
             # eval_XyXnn=(mil_test.X, mil_test.y.reshape((-1, 1)), mil_test.group_ids.reshape((-1, 1)))
         )
         return self
@@ -189,39 +218,56 @@ class GradBoostingRegressor(RegressorMixin, BaseEstimator):
         self.stnn.fit(
             mil_train.X,
             mil_train.y.reshape((-1, 1)) if mil_train.y.ndim == 1 else mil_train.y,
-            X_nn=mil_train.group_ids.reshape((-1, 1)),
+            # X_nn=mil_train.group_ids.reshape((-1, 1)),
+            X_nn=_make_group_context(mil_tran, bag_X),
             # eval_XyXnn=(mil_test.X, mil_test.y.reshape((-1, 1)), mil_test.group_ids.reshape((-1, 1)))
         )
         return self
 
-    def predict(self, X, group_sizes):
-        mil_test = MILData(X, None, group_sizes)
-        return self.stnn.predict(X=mil_test.X, X_nn=mil_test.group_ids.reshape((-1, 1))).numpy()
+    def predict(self, X, group_sizes, bag_X=None):
+        # mil_test = MILData(X, None, group_sizes)
+        # return self.stnn.predict(X=mil_test.X, X_nn=mil_test.group_ids.reshape((-1, 1))).numpy()
+        return np.argmax(
+            self.predict_prob(X, group_sizes, bag_X=bag_X),
+            axis=1
+        )
 
-    def predict_attention_logits(self, X, group_sizes, grouped: bool = True):
+    def predict_proba(self, X, group_sizes, bag_X=None):
+        mil_train=MILData(X, None, group_sizes)
+
+        proba=sigmoid(
+            self.stnn.predict(
+                X=mil_train.X, 
+                X_nn=_make_group_context(mil_train, bag_X)
+            ).numpy()
+
+        )
+        return np.concatenate([1-proba, proba], axis=1)
+
+    def predict_attention_logits(self, X, group_sizes, grouped: bool = True, bag_X=None):
         """Return raw attention logits, either flattened or grouped by bag."""
         mil_data = MILData(X, None, group_sizes)
         logits = self.stnn.predict_attention_logits(
             X=mil_data.X,
-            X_nn=mil_data.group_ids.reshape((-1, 1)),
-        ).numpy()
+            X_nn=_make_group_context(mil_data, bag_X)).numpy()
+        
         return _group_instance_outputs(logits, mil_data) if grouped else logits
 
-    def predict_attention_weights(self, X, group_sizes, grouped: bool = True):
+    def predict_attention_weights(self, X, group_sizes, grouped: bool = True, bag_X=None):
         """Return post-softmax attention weights, either flattened or per bag."""
         mil_data = MILData(X, None, group_sizes)
         weights = self.stnn.predict_attention_weights(
             X=mil_data.X,
-            X_nn=mil_data.group_ids.reshape((-1, 1)),
+            X_nn=_make_group_context(mil_data, bag_X)
         ).numpy()
         return _group_instance_outputs(weights, mil_data) if grouped else weights
 
-    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True):
+    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True, bag_X=None):
         """Return the dense per-instance tree embeddings used by attention."""
         mil_data = MILData(X, None, group_sizes)
         embeddings = self.stnn.predict_instance_embeddings(
             X=mil_data.X,
-            X_nn=mil_data.group_ids.reshape((-1, 1)),
+            X_nn=_make_group_context(mil_data, bag_X)
         ).numpy()
         return _group_instance_outputs(embeddings, mil_data) if grouped else embeddings
 
