@@ -51,6 +51,7 @@ def _validate_bag_X(bag_X, group_sizes):
     if bag_X is None:
         return None
     
+    bag_X = np.asarray(bag_X)
     if bag_X.ndim==1:
         bag_X=bag_X.reshape(-1, 1)
     
@@ -115,43 +116,48 @@ class GradBoostingClassifier(ClassifierMixin, BaseEstimator):
             mil_train.X,
             mil_train.y.reshape((-1, 1)) if mil_train.y.ndim == 1 else mil_train.y,
             # X_nn=mil_train.group_ids.reshape((-1, 1)),
-            X_nn=
+            X_nn=_make_group_context(mil_train, bag_X)
             # eval_XyXnn=(mil_test.X, mil_test.y.reshape((-1, 1)), mil_test.group_ids.reshape((-1, 1)))
         )
         return self
 
-    def predict_proba(self, X, group_sizes):
+    def predict_proba(self, X, group_sizes, bag_X=None):
         mil_train = MILData(X, None, group_sizes)
-        proba = sigmoid(self.stnn.predict(X=mil_train.X, X_nn=mil_train.group_ids.reshape((-1, 1))).numpy())
+        proba = sigmoid(
+            self.stnn.predict(
+                X=mil_train.X,
+                X_nn=_make_group_context(mil_train, bag_X),
+            ).numpy()
+        )
         return np.concatenate([1.0 - proba, proba], axis=1)
 
-    def predict(self, X, group_sizes):
-        return np.argmax(self.predict_proba(X, group_sizes), axis=1)
+    def predict(self, X, group_sizes, bag_X=None):
+        return np.argmax(self.predict_proba(X, group_sizes, bag_X=bag_X), axis=1)
 
-    def predict_attention_logits(self, X, group_sizes, grouped: bool = True):
+    def predict_attention_logits(self, X, group_sizes, grouped: bool = True, bag_X=None):
         """Return raw attention logits, either flattened or grouped by bag."""
         mil_data = MILData(X, None, group_sizes)
         logits = self.stnn.predict_attention_logits(
             X=mil_data.X,
-            X_nn=mil_data.group_ids.reshape((-1, 1)),
+            X_nn=_make_group_context(mil_data, bag_X),
         ).numpy()
         return _group_instance_outputs(logits, mil_data) if grouped else logits
 
-    def predict_attention_weights(self, X, group_sizes, grouped: bool = True):
+    def predict_attention_weights(self, X, group_sizes, grouped: bool = True, bag_X=None):
         """Return post-softmax attention weights, either flattened or per bag."""
         mil_data = MILData(X, None, group_sizes)
         weights = self.stnn.predict_attention_weights(
             X=mil_data.X,
-            X_nn=mil_data.group_ids.reshape((-1, 1)),
+            X_nn=_make_group_context(mil_data, bag_X),
         ).numpy()
         return _group_instance_outputs(weights, mil_data) if grouped else weights
 
-    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True):
+    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True, bag_X=None):
         """Return the dense per-instance tree embeddings used by attention."""
         mil_data = MILData(X, None, group_sizes)
         embeddings = self.stnn.predict_instance_embeddings(
             X=mil_data.X,
-            X_nn=mil_data.group_ids.reshape((-1, 1)),
+            X_nn=_make_group_context(mil_data, bag_X),
         ).numpy()
         return _group_instance_outputs(embeddings, mil_data) if grouped else embeddings
 
@@ -218,56 +224,39 @@ class GradBoostingRegressor(RegressorMixin, BaseEstimator):
         self.stnn.fit(
             mil_train.X,
             mil_train.y.reshape((-1, 1)) if mil_train.y.ndim == 1 else mil_train.y,
-            # X_nn=mil_train.group_ids.reshape((-1, 1)),
-            X_nn=_make_group_context(mil_tran, bag_X),
+            X_nn=mil_train.group_ids.reshape((-1, 1)),
             # eval_XyXnn=(mil_test.X, mil_test.y.reshape((-1, 1)), mil_test.group_ids.reshape((-1, 1)))
         )
         return self
 
-    def predict(self, X, group_sizes, bag_X=None):
-        # mil_test = MILData(X, None, group_sizes)
-        # return self.stnn.predict(X=mil_test.X, X_nn=mil_test.group_ids.reshape((-1, 1))).numpy()
-        return np.argmax(
-            self.predict_prob(X, group_sizes, bag_X=bag_X),
-            axis=1
-        )
+    def predict(self, X, group_sizes):
+        mil_test = MILData(X, None, group_sizes)
+        return self.stnn.predict(X=mil_test.X, X_nn=mil_test.group_ids.reshape((-1, 1))).numpy()
 
-    def predict_proba(self, X, group_sizes, bag_X=None):
-        mil_train=MILData(X, None, group_sizes)
-
-        proba=sigmoid(
-            self.stnn.predict(
-                X=mil_train.X, 
-                X_nn=_make_group_context(mil_train, bag_X)
-            ).numpy()
-
-        )
-        return np.concatenate([1-proba, proba], axis=1)
-
-    def predict_attention_logits(self, X, group_sizes, grouped: bool = True, bag_X=None):
+    def predict_attention_logits(self, X, group_sizes, grouped: bool = True):
         """Return raw attention logits, either flattened or grouped by bag."""
         mil_data = MILData(X, None, group_sizes)
         logits = self.stnn.predict_attention_logits(
             X=mil_data.X,
-            X_nn=_make_group_context(mil_data, bag_X)).numpy()
-        
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
+        ).numpy()
         return _group_instance_outputs(logits, mil_data) if grouped else logits
 
-    def predict_attention_weights(self, X, group_sizes, grouped: bool = True, bag_X=None):
+    def predict_attention_weights(self, X, group_sizes, grouped: bool = True):
         """Return post-softmax attention weights, either flattened or per bag."""
         mil_data = MILData(X, None, group_sizes)
         weights = self.stnn.predict_attention_weights(
             X=mil_data.X,
-            X_nn=_make_group_context(mil_data, bag_X)
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
         ).numpy()
         return _group_instance_outputs(weights, mil_data) if grouped else weights
 
-    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True, bag_X=None):
+    def predict_instance_embeddings(self, X, group_sizes, grouped: bool = True):
         """Return the dense per-instance tree embeddings used by attention."""
         mil_data = MILData(X, None, group_sizes)
         embeddings = self.stnn.predict_instance_embeddings(
             X=mil_data.X,
-            X_nn=_make_group_context(mil_data, bag_X)
+            X_nn=mil_data.group_ids.reshape((-1, 1)),
         ).numpy()
         return _group_instance_outputs(embeddings, mil_data) if grouped else embeddings
 

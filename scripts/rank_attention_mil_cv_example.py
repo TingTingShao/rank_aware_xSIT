@@ -82,7 +82,7 @@ def add_test_metadata(rankings, df_test_sorted):
 def run_fold(dataset_name, fold_id, df, train_pids, test_pids):
     df_train, df_test = split_dataframe_by_pid(df, train_pids, test_pids)
 
-    X, y, group_sizes, instance_y, instance_names, _ = make_mil_arrays_from_dataframe(
+    X, y, group_sizes, instance_y, instance_names, _, bag_X = make_mil_arrays_from_dataframe(
         df_train
     )
     (
@@ -92,6 +92,7 @@ def run_fold(dataset_name, fold_id, df, train_pids, test_pids):
         instance_y_te,
         instance_names_te,
         df_test_sorted,
+        bag_X_te,
     ) = make_mil_arrays_from_dataframe(df_test)
 
     print(
@@ -103,11 +104,15 @@ def run_fold(dataset_name, fold_id, df, train_pids, test_pids):
     )
 
     model = make_model()
-    model.fit(X, y, group_sizes, instance_y=instance_y)
+    model.fit(X, y, group_sizes, instance_y=instance_y, bag_X=bag_X)
 
-    attention_logits = model.predict_attention_logits(X_te, group_sizes_te, grouped=True)
-    attention_weights = model.predict_attention_weights(X_te, group_sizes_te, grouped=True)
-    bag_probs = model.predict_proba(X_te, group_sizes_te)
+    attention_logits = model.predict_attention_logits(
+        X_te, group_sizes_te, grouped=True, bag_X=bag_X_te
+    )
+    attention_weights = model.predict_attention_weights(
+        X_te, group_sizes_te, grouped=True, bag_X=bag_X_te
+    )
+    bag_probs = model.predict_proba(X_te, group_sizes_te, bag_X=bag_X_te)
 
     rankings = generate_rankings(
         group_sizes_te,
@@ -122,7 +127,6 @@ def run_fold(dataset_name, fold_id, df, train_pids, test_pids):
     rankings["fold"] = fold_id
 
     return rankings
-
 
 def run_dataset(dataset_name, dataset_path):
     df = pd.read_csv(dataset_path)
@@ -162,3 +166,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

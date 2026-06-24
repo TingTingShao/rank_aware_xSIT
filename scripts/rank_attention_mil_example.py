@@ -30,10 +30,10 @@ CYCLE_FEATURES = [
     "n_2pn",
     "freeze_all",
     "usable_embryos",
-    "pituitary_inhibition_agonist-long",
-    "pituitary_inhibition_agonist-short",
-    "pituitary_inhibition_antagonist",
-    "pituitary_inhibition_none",
+    # "pituitary_inhibition_agonist-long",
+    # "pituitary_inhibition_agonist-short",
+    # "pituitary_inhibition_antagonist",
+    # "pituitary_inhibition_none",
 ]
 
 DAY3_FEATURES = [
@@ -81,7 +81,7 @@ TRANSFER_ORDER_COL = "transfer_order"
 
 def make_mil_arrays_from_dataframe(
     df,
-    feature_fill_value=0.0
+    # feature_fill_value=0.0
 ):
     """Convert one-embryo-per-row dataframe into GradBoostingClassifier inputs.
 
@@ -101,16 +101,18 @@ def make_mil_arrays_from_dataframe(
     df_sorted : pd.DataFrame
         Sorted dataframe aligned with X and instance_y.
     """
-    # features = CYCLE_FEATURES + DAY3_FEATURES + DAY56_FEATURES
-    features = CYCLE_FEATURES + DAY56_FEATURES
-    # features = DAY3_FEATURES + DAY56_FEATURES
+    bag_features = CYCLE_FEATURES
+    # inst_features = DAY3_FEATURES + DAY56_FEATURES
+    inst_features=DAY56_FEATURES
 
     required_cols = [
         BAG_ID_COL,
         BAG_LABEL_COL,
         INST_ID_COL,
         INST_LABEL_COL,
-        *features,
+        # *features,
+        *bag_features,
+        *inst_features
     ]
     missing_cols = [col for col in required_cols if col not in df.columns]
     if missing_cols:
@@ -142,10 +144,12 @@ def make_mil_arrays_from_dataframe(
             f"{inconsistent_bags.index.tolist()[:10]}"
         )
 
-    X_df = df_sorted[features].apply(pd.to_numeric, errors="coerce")
-    X = X_df.fillna(feature_fill_value).to_numpy(dtype=np.float64)
+    X_df = df_sorted[inst_features].apply(pd.to_numeric, errors="coerce")
+    X = X_df.to_numpy(dtype=np.float64)
     y = grouped[BAG_LABEL_COL].first().astype(float).to_numpy(dtype=np.float64)
     group_sizes = grouped.size().to_numpy(dtype=int)
+    bag_X_df = grouped[bag_features].first().apply(pd.to_numeric, errors="coerce")
+    bag_X = bag_X_df.to_numpy(dtype=np.float64)
 
     instance_y = pd.to_numeric(
         df_sorted[INST_LABEL_COL],
@@ -159,7 +163,7 @@ def make_mil_arrays_from_dataframe(
         + df_sorted[INST_ID_COL].astype(str)
     ).to_numpy()
 
-    return X, y, group_sizes, instance_y, instance_names, df_sorted
+    return X, y, group_sizes, instance_y, instance_names, df_sorted, bag_X
 
 
 
@@ -169,7 +173,8 @@ def make_model():
         lr=1.0,
         max_depth=2,
         splitter="random",
-        n_estimators=100,
+        # n_estimators=100,
+        n_estimators=10,
         n_update_iterations=1,
         embedding_size=8,
         nn_lr=1e-3,
@@ -179,12 +184,12 @@ def make_model():
         # Pairwise RankNet attention-logit ranking: known positive instances
         # should receive higher raw attention logits than known negative
         # instances in the same bag.
-        # lambda_rank=0.5,
-        lambda_rank=0,
-        # rank_margin=0.0,
+        lambda_rank=0.5,
+        # lambda_rank=0,
+        rank_margin=0.0,
         # Optional pointwise supervision on the same raw attention logits.
-        # lambda_inst=0.1,
-        lambda_inst=0.0,
+        lambda_inst=0.1,
+        # lambda_inst=0.0,
     )
 
 
@@ -256,13 +261,12 @@ def main():
     # prediction time and you are comfortable using it as an embryo feature.
     # X, y, group_sizes, instance_y, instance_names = make_small_mil_dataset()
     import os
-    import pickle
     import cloudpickle
     path="/mnt/c/Users/u0155664/OneDrive - KU Leuven/phd/1_projects/multiinstanceEmbryoRanking/analysis"
     df_train=pd.read_csv(os.path.join(path, "data/train_corrected_remove.csv"))
     df_test=pd.read_csv(os.path.join(path, "data/test_corrected_remove.csv"))
-    X, y, group_sizes, instance_y, instance_names, _ = make_mil_arrays_from_dataframe(df_train)
-    X_te, y_te, group_sizes_te, instance_y_te, instance_names_te, df_test_sorted = make_mil_arrays_from_dataframe(df_test)
+    X, y, group_sizes, instance_y, instance_names, _, bag_X = make_mil_arrays_from_dataframe(df_train)
+    X_te, y_te, group_sizes_te, instance_y_te, instance_names_te, df_test_sorted, bag_X_te = make_mil_arrays_from_dataframe(df_test)
     print(
         "Bag counts:",
         f"train df={df_train[BAG_ID_COL].nunique(dropna=False)} converted={len(group_sizes)}",
@@ -281,15 +285,16 @@ def main():
         f"y={type(y).__name__}{y.shape}/{y.dtype}",
         f"group_sizes={type(group_sizes).__name__}{group_sizes.shape}/{group_sizes.dtype}",
         f"instance_y={type(instance_y).__name__}{instance_y.shape}/{instance_y.dtype}",
+        f"bag_X={type(bag_X).__name__}{bag_X.shape}/{bag_X.dtype}",
     )
-    model.fit(X, y, group_sizes, instance_y=instance_y)
+    model.fit(X, y, group_sizes, instance_y=instance_y, bag_X=bag_X)
 
     # Raw logits are the supervised scores used by RankNet and instance BCE.
     # Weights are the softmax-normalized attention scores used by aggregation.
-    attention_logits = model.predict_attention_logits(X_te, group_sizes_te, grouped=True)
-    attention_weights = model.predict_attention_weights(X_te, group_sizes_te, grouped=True)
+    attention_logits = model.predict_attention_logits(X_te, group_sizes_te, grouped=True, bag_X=bag_X_te)
+    attention_weights = model.predict_attention_weights(X_te, group_sizes_te, grouped=True, bag_X=bag_X_te)
 
-    bag_probs = model.predict_proba(X_te, group_sizes_te)
+    bag_probs = model.predict_proba(X_te, group_sizes_te, bag_X=bag_X_te)
     bag_preds = np.argmax(bag_probs, axis=1)
 
     rankings = generate_rankings(
@@ -306,13 +311,15 @@ def main():
     # rankings["bag_probability_0"] = np.repeat(bag_probs[:, 0], group_sizes_te)
     rankings["bag_probability_1"] = np.repeat(bag_probs[:, 1], group_sizes_te)
     rankings["bag_livebirth_probability"] = rankings["bag_probability_1"]
-    rankings.to_csv(os.path.join(path, "test_attention_rankings_corrected_norankingloss_day56.csv"), index=False)
+    rankings.to_csv(os.path.join(path, "test_attention_rankings_extension01_reduced_bag_feat.csv"), index=False)
     # model.save(os.path.join(path, "rank_attention_mil_model_corrected.pkl"))
     # pickle save model 
-    with open(os.path.join(path, "rank_attention_mil_model_corrected_remove_norankingloss_day56.pkl"), 'wb') as file:
+    with open(os.path.join(path, "rank_attention_mil_model_extension01_norankingloss_reduced_bag_feat.pkl"), 'wb') as file:
         cloudpickle.dump(model, file)
     print(rankings.head(20))
 
 
 if __name__ == "__main__":
     main()
+
+

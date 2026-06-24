@@ -111,7 +111,7 @@ class AttentionAggregationNN(torch.nn.Module):
     
     def _bag_features_by_group(self, group_ids, repeated_bag_features):
         if repeated_bag_features is None:
-            if self.bag_features_dim: 
+            if self.bag_feature_dim: 
                 raise ValueError("Bag features are required for this model")
             return None
 
@@ -200,7 +200,7 @@ class AttentionAggregationNN(torch.nn.Module):
         self.last_attention_weights = flat_attention_weights
 
         group_embeddings = group_embeddings.squeeze(1)
-        self.last_group_embedding=group_embeddings.detach().clone()
+        self.last_group_embeddings = group_embeddings.detach().clone()
 
         bag_features=self._bag_features_by_group(group_ids, repeated_bag_features)
 
@@ -217,6 +217,7 @@ class SetTreeNN(TreeNN):
         self.nn_steps = 1
         self.nn_num_heads = 4
         self.dropout = 0.0
+        self.bag_feature_dim = 0
         self.random_state = 1
         self.loss_fn = 'se'
         self.rank_loss_weight = 0.0
@@ -234,6 +235,7 @@ class SetTreeNN(TreeNN):
                 num_heads=self.nn_num_heads,
                 dropout=self.dropout,
                 out_features=self.n_outputs_,
+                bag_feature_dim=self.bag_feature_dim,
             )
         )
 
@@ -329,7 +331,7 @@ class SetTreeNN(TreeNN):
             self.instance_labels_torch_ = None
 
     def _predict_nn(self, cur_X_torch, cur_trees_predictions_torch):
-        return self.nn_(cur_trees_predictions_torch, group_ids=cur_X_torch)
+        return self.nn_(cur_trees_predictions_torch, cur_X_torch)
 
     def _predict_attention_outputs(self, cur_X_torch, cur_trees_predictions_torch):
         """Run a forward pass and return the cached per-instance attention data."""
@@ -395,7 +397,7 @@ class SetTreeNN(TreeNN):
         if labels is None:
             return None
 
-        group_ids = cur_X_torch.ravel().to(device=scores.device, dtype=torch.long)
+        group_ids = cur_X_torch[:, 0].ravel().to(device=scores.device, dtype=torch.long)
         losses = []
         for gid in torch.unique(group_ids):
             group_mask = group_ids == gid
@@ -508,3 +510,7 @@ class SetTreeNN(TreeNN):
         loss = self.__loss_fn(cur_X_torch, cur_y_torch, nn_preds)
         grads, = torch.autograd.grad(loss, cur_sample_predictions)
         return grads
+
+
+
+
