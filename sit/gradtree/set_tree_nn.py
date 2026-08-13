@@ -156,6 +156,7 @@ class SetTreeNN(TreeNN):
         self.metrics = {
             'r2': r2_score,
         }
+        self._rank_pair_cache=None
         self.make_nn = lambda: (
             AttentionAggregationNN(
                 embed_dim=self.embedding_size,
@@ -164,6 +165,11 @@ class SetTreeNN(TreeNN):
                 out_features=self.n_outputs_,
             )
         )
+    
+    def set_instance_labels(self, instance_labels):
+        self.instance_labels=instance_labels
+        self._rank_pair_cache=None
+        return self
 
     def set_embedding_size(self, embedding_size: int):
         self.embedding_size = embedding_size
@@ -237,6 +243,7 @@ class SetTreeNN(TreeNN):
         self.n_outputs_ = y_torch.shape[1]
         self.nn_ = self.make_nn().to(torch.float64)
         self.optim_ = torch.optim.AdamW(self.nn_.parameters(), lr=self.nn_lr)
+        self._rank_pair_cache=None
         if self.instance_labels is not None:
             self.instance_labels_torch_ = torch.as_tensor(
                 self.instance_labels,
@@ -297,6 +304,157 @@ class SetTreeNN(TreeNN):
     @staticmethod
     def __valid_instance_label_mask(labels):
         return torch.isfinite(labels) & (labels >= 0.0)
+        
+    def __build_rank_pair_cache(
+        self,
+        scores,
+        labels,
+        group_ids,
+    ):
+        """
+        Precompute all valid higher-label/lower-label instance pairs.
+
+        Each stored pair receives a weight that preserves the original
+        calculation:
+
+            sum over bags(
+                mean over valid heads(
+                    mean over valid pairs(loss)
+                )
+            )
+        """
+        positive_indices = []
+        negative_indices = []
+        head_indices = []
+        pair_weights = []
+
+        for gid in torch.unique(group_ids):
+            bag_indices = torch.nonzero(
+                group_ids == gid,
+                as_tuple=False,
+            ).flatten()
+
+            bag_labels = labels[bag_indices]
+            valid_labels = self.__valid_instance_label_mask(
+                bag_labels
+            )
+
+            bag_head_pairs = []
+
+            for head_id in range(scores.shape[1]):
+                head_valid = valid_labels[:, head_id]
+
+                if int(head_valid.sum()) < 2:
+                    continue
+
+                valid_global_indices = bag_indices[head_valid]
+                valid_y = bag_labels[
+                    head_valid,
+                    head_id,
+                ]
+
+                # pair_i should rank above pair_j.
+                pair_i, pair_j = torch.where(
+                    valid_y[:, None] > valid_y[None, :]
+                )
+
+                if pair_i.numel() == 0:
+                    continue
+
+                bag_head_pairs.append(
+                    (
+                        head_id,
+                        valid_global_indices[pair_i],
+                        valid_global_indices[pair_j],
+                    )
+                )
+
+            if not bag_head_pairs:
+                continue
+
+            # The original implementation first averages heads within
+            # each bag and then sums the bag losses.
+            n_valid_heads = len(bag_head_pairs)
+
+            for (
+                head_id,
+                positive_index,
+                negative_index,
+            ) in bag_head_pairs:
+                n_pairs = positive_index.numel()
+
+                positive_indices.append(positive_index)
+                negative_indices.append(negative_index)
+
+                head_indices.append(
+                    torch.full(
+                        (n_pairs,),
+                        head_id,
+                        dtype=torch.long,
+                        device=scores.device,
+                    )
+                )
+
+                pair_weights.append(
+                    torch.full(
+                        (n_pairs,),
+                        1.0 / (n_valid_heads * n_pairs),
+                        dtype=scores.dtype,
+                        device=scores.device,
+                    )
+                )
+
+        if positive_indices:
+            positive_indices = torch.cat(positive_indices)
+            negative_indices = torch.cat(negative_indices)
+            head_indices = torch.cat(head_indices)
+            pair_weights = torch.cat(pair_weights)
+        else:
+            positive_indices = torch.empty(
+                0,
+                dtype=torch.long,
+                device=scores.device,
+            )
+            negative_indices = torch.empty(
+                0,
+                dtype=torch.long,
+                device=scores.device,
+            )
+            head_indices = torch.empty(
+                0,
+                dtype=torch.long,
+                device=scores.device,
+            )
+            pair_weights = torch.empty(
+                0,
+                dtype=scores.dtype,
+                device=scores.device,
+            )
+
+        return {
+            # Retain a copy to verify that subsequent calls use the same
+            # bag arrangement before reusing the cached pair indices.
+            "group_ids": group_ids.detach().clone(),
+            "n_heads": scores.shape[1],
+            "positive_indices": positive_indices,
+            "negative_indices": negative_indices,
+            "head_indices": head_indices,
+            "pair_weights": pair_weights,
+        }
+
+# This changes repeated ranking-loss work from:
+
+# Scan all instances separately for every bag
+# Rebuild all label-difference matrices
+# Rebuild all pair masks
+# Loop over every head
+
+# to:
+
+# Check that bag membership is unchanged
+# Retrieve the already-prepared pairs
+# Calculate score differences only for valid pairs
+# Apply softplus once to all pairs
 
     def __rank_loss(self, cur_X_torch):
         """Pairwise rank loss on raw attention logits inside each bag and each attention logit
@@ -314,61 +472,54 @@ class SetTreeNN(TreeNN):
 
         group_ids = cur_X_torch.ravel().to(device=scores.device, dtype=torch.long)
 
-        losses = []
+        cache = self._rank_pair_cache
 
-        # ranking loss in each bag
-        for gid in torch.unique(group_ids):
-            group_mask = group_ids == gid
+        cache_is_valid = (
+            cache is not None
+            and cache["n_heads"] == scores.shape[1]
+            and cache["group_ids"].shape == group_ids.shape
+            and torch.equal(
+                cache["group_ids"],
+                group_ids,
+            )
+        )
 
-            # shape [bag_size, n_heads]
-            group_scores = scores[group_mask]
-            group_labels = labels[group_mask]
-            valid_labels = self.__valid_instance_label_mask(group_labels)
+        if not cache_is_valid:
+            cache = self.__build_rank_pair_cache(
+                scores,
+                labels,
+                group_ids,
+            )
+            self._rank_pair_cache = cache
 
-            head_losses=[]
-            for head_id in range(group_scores.shape[1]):
-                output_valid = valid_labels[:, head_id]
-                
-                # there must be at least two annotated instances 
-                if output_valid.sum() < 2:
-                    continue
-                
-                # example (ranking loss in each head)
-                # label 1.0 should rank above label 0.67
-                # label 0.67 should rank above label 0.33
-                # label 0.33 should rank above label 0.0
-                valid_scores=group_scores[output_valid, head_id]
-                valid_y=group_labels[output_valid, head_id]
+        positive_indices = cache["positive_indices"]
 
-                # pair_mask[i, j] is True, when instance i should rank above instance j
-                label_diff = valid_y[:, None] - valid_y[None, :]
-
-                # # pairwise label difference 
-                label_diff=valid_y[:, None] - valid_y[None, :]
-
-                # # embryo i should rank above embryo j if lable_i > label_j
-                pair_mask=label_diff>0
-
-                if not torch.any(pair_mask):
-                    continue
-
-                score_diff=(
-                    valid_scores[:, None] 
-                    - valid_scores[None, :]
-                    )
-
-                diffs=score_diff[pair_mask]-self.rank_loss_margin
-
-                pair_losses=torch.nn.functional.softplus(-diffs)
-
-                head_losses.append(pair_losses.mean())
-            
-            if head_losses:
-                losses.append(torch.stack(head_losses).mean())
-
-        if len(losses) == 0:
+        if positive_indices.numel() == 0:
             return scores.new_zeros(())
-        return torch.stack(losses).sum()
+
+        negative_indices = cache["negative_indices"]
+        head_indices = cache["head_indices"]
+        pair_weights = cache["pair_weights"]
+
+        score_differences = (
+            scores[
+                positive_indices,
+                head_indices,
+            ]
+            - scores[
+                negative_indices,
+                head_indices,
+            ]
+            - self.rank_loss_margin
+        )
+
+        pair_losses = torch.nn.functional.softplus(
+            -score_differences
+        )
+
+        return torch.sum(
+            pair_weights * pair_losses
+        )
 
     def __instance_loss(self, cur_X_torch):
         scores = getattr(self.nn_, 'last_attention_logits', None)
