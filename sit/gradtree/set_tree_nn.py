@@ -113,8 +113,8 @@ class AttentionAggregationNN(torch.nn.Module):
         # do not detach this tensor, rank loss needs its gradient 
         self.last_attention_logits_per_head=per_head_logits
 
-        attention_logits = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
-        attention_logits[self.instance_sorter] = padded_attention_logits[self.emplacement_ids].reshape((-1, 1))
+        # attention_logits = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
+        # attention_logits[self.instance_sorter] = padded_attention_logits[self.emplacement_ids].reshape((-1, 1))
         self.last_attention_logits = per_head_logits.mean(
             dim=1,
             keepdim=True
@@ -192,6 +192,8 @@ class SetTreeNN(TreeNN):
     def set_rank_loss(self, instance_labels=None, rank_loss_weight: float = 0.0,
                       rank_loss_margin: float = 0.0, instance_loss_weight: float = 0.0):
         self.rank_loss_weight = rank_loss_weight
+        if not 0<=rank_loss_weight<=1:
+            raise ValueError("rank_loss_weight must be between 0 and 1")
         self.rank_loss_margin = rank_loss_margin
         self.instance_loss_weight = instance_loss_weight
         if instance_labels is not None:
@@ -366,7 +368,7 @@ class SetTreeNN(TreeNN):
 
         if len(losses) == 0:
             return scores.new_zeros(())
-        return torch.stack(losses).mean()
+        return torch.stack(losses).sum()
 
     def __instance_loss(self, cur_X_torch):
         scores = getattr(self.nn_, 'last_attention_logits', None)
