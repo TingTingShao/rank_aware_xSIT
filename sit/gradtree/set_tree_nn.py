@@ -305,32 +305,32 @@ class SetTreeNN(TreeNN):
                 if len(pos_scores) == 0 or len(neg_scores) == 0:
                     continue
                 # panelize cases where positive attention logits are not higher than negative attention logist by a margin
-                diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
-                losses.append(torch.nn.functional.softplus(-diffs).mean())
+                # diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
+                # losses.append(torch.nn.functional.softplus(-diffs).mean())
 
                 # example
                 # label 1.0 should rank above label 0.67
                 # label 0.67 should rank above label 0.33
                 # label 0.33 should rank above label 0.0
-                # valid_scores=group_scores[output_valid, output_id]
-                # valid_y=output_labels[output_valid]
+                valid_scores=group_scores[output_valid, output_id]
+                valid_y=output_labels[output_valid]
 
                 # # pairwise label difference 
-                # label_diff=valid_y[:, None] - valid_y[None, :]
+                label_diff=valid_y[:, None] - valid_y[None, :]
 
                 # # embryo i should rank above embryo j if lable_i > label_j
-                # pair_mask=label_diff>0
+                pair_mask=label_diff>0
 
-                # if pair_mask.sum()==0:
-                #     continue 
+                if pair_mask.sum()==0:
+                    continue 
 
-                # score_diff=valid_scores[:, None] - valid_scores[None, :]
+                score_diff=valid_scores[:, None] - valid_scores[None, :]
 
-                # diffs=score_diff[pair_mask]-self.rank_loss_margin
+                diffs=score_diff[pair_mask]-self.rank_loss_margin
 
-                # pair_losses=torch.nn.functional.softplus(-diffs)
+                pair_losses=torch.nn.functional.softplus(-diffs)
 
-                # losses.append(pair_losses.mean())
+                losses.append(pair_losses.mean())
 
         if len(losses) == 0:
             return scores.new_zeros(())
