@@ -26,16 +26,50 @@ class AttentionAggregationNN(torch.nn.Module):
         self.last_attention_weights = None
 
     def _recompute_group_cache(self, group_ids):
-        if group_ids is self.group_ids:
-            return
-        # print('Recomputing cache')
-        self.group_ids = group_ids
+        group_ids = group_ids.reshape(-1)
 
-        group_ids = group_ids.ravel().to(torch.long)
-        # These operations can be run once in advance
-        unique_group_ids, group_sizes = torch.unique(group_ids, return_counts=True)
-        self.n_groups = len(unique_group_ids)
-        self.max_group_size = torch.max(group_sizes)
+        # Compare values rather than object identity.
+        if (
+            self.group_ids is not None
+            and self.group_ids.device == group_ids.device
+            and torch.equal(self.group_ids, group_ids)
+        ):
+            return
+
+        self.group_ids = group_ids.detach().clone()
+
+        unique_group_ids, dense_group_ids, group_sizes = torch.unique(
+            group_ids,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+
+        if unique_group_ids.numel() == 0:
+            raise ValueError("At least one instance is required")
+
+        self.unique_group_ids = unique_group_ids
+        self.n_groups = unique_group_ids.numel()
+        self.max_group_size = int(group_sizes.max().item())
+
+        positions = torch.arange(
+            self.max_group_size,
+            device=group_ids.device,
+        )
+
+        # True marks padding.
+        self.kp_mask = positions.unsqueeze(0) >= group_sizes.unsqueeze(1)
+        self.emplacement_ids = torch.where(~self.kp_mask)
+
+        # Sort using dense IDs such as [0, 0, 1], not raw IDs [2, 2, 5].
+        self.instance_sorter = torch.argsort(
+            dense_group_ids,
+            stable=True,
+        )
+        self.inverse_instance_sorter = torch.argsort(
+            self.instance_sorter,
+            stable=True,
+        )
 
 
         self.kp_mask = torch.zeros(self.n_groups, self.max_group_size, dtype=torch.bool)  # this mask can also be prefilled
@@ -80,6 +114,17 @@ class AttentionAggregationNN(torch.nn.Module):
         return logits
 
     def forward(self, tree_preds, group_ids):
+
+        group_ids = group_ids.reshape(-1).to(
+            device=tree_preds.device,
+            dtype=torch.long,
+        )
+
+        if len(group_ids) != len(tree_preds):
+            raise ValueError(
+                "group_ids must contain one ID per instance"
+        )
+
         self._recompute_group_cache(group_ids)
         embed_dim = tree_preds.shape[1]
         # Cache the dense tree embeddings that are actually consumed by the
@@ -88,7 +133,9 @@ class AttentionAggregationNN(torch.nn.Module):
 
         # Pack flattened instance embeddings into a padded bag-major tensor.
         embs = torch.zeros(self.n_groups, self.max_group_size, embed_dim, dtype=tree_preds.dtype)
+
         embs[self.emplacement_ids] = tree_preds[self.instance_sorter]
+        
         query = self.query.expand(embs.shape[0], 1, embs.shape[2])
 
         # Keep raw logits in flattened instance order so ranking loss and
@@ -204,10 +251,6 @@ class SetTreeNN(TreeNN):
         self.instance_loss_weight = instance_loss_weight
         if instance_labels is not None:
             self.set_instance_labels(instance_labels)
-        return self
-
-    def set_instance_labels(self, instance_labels):
-        self.instance_labels = instance_labels
         return self
 
     def set_make_nn(self, make_nn):
