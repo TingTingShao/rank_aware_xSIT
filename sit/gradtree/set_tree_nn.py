@@ -390,17 +390,38 @@ class SetTreeNN(TreeNN):
         )
 
     def __add_auxiliary_losses(self, bag_loss, cur_X_torch):
-        """Attach optional rank / instance supervision to the bag loss."""
-        # rank loss weight is between 0-1 and is used to balance the bag loss and rank loss
-        loss = bag_loss
-        if self.rank_loss_weight:
+        """Combine bag, ranking, and instance losses as a convex mixture."""
+
+        rank_weight = self.rank_loss_weight
+        instance_weight = self.instance_loss_weight
+        bag_weight = 1.0 - rank_weight - instance_weight
+
+        if rank_weight < 0.0 or instance_weight < 0.0:
+            raise ValueError("Loss weights must be non-negative")
+
+        if bag_weight < 0.0:
+            raise ValueError(
+                "rank_loss_weight + instance_loss_weight must be <= 1"
+            )
+
+        loss = bag_weight * bag_loss
+
+        if rank_weight:
             rank_loss = self.__rank_loss(cur_X_torch)
-            if rank_loss is not None:
-                loss = (1-self.rank_loss_weight) * loss + self.rank_loss_weight * rank_loss
-        if self.instance_loss_weight:
+            if rank_loss is None:
+                raise RuntimeError(
+                    "Ranking loss is enabled but could not be calculated"
+                )
+            loss = loss + rank_weight * rank_loss
+
+        if instance_weight:
             instance_loss = self.__instance_loss(cur_X_torch)
-            if instance_loss is not None:
-                loss = loss + self.instance_loss_weight * instance_loss
+            if instance_loss is None:
+                raise RuntimeError(
+                    "Instance loss is enabled but could not be calculated"
+                )
+            loss = loss + instance_weight * instance_loss
+
         return loss
 
     def __loss_fn(self, cur_X_torch, cur_y_torch, nn_preds):
