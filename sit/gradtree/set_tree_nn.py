@@ -361,7 +361,7 @@ class SetTreeNN(TreeNN):
         if self.rank_loss_weight:
             rank_loss = self.__rank_loss(cur_X_torch)
             if rank_loss is not None:
-                loss = loss + self.rank_loss_weight * rank_loss
+                loss = (1-self.rank_loss_weight) * loss + self.rank_loss_weight * rank_loss
         if self.instance_loss_weight:
             instance_loss = self.__instance_loss(cur_X_torch)
             if instance_loss is not None:
