@@ -37,12 +37,14 @@ class AttentionAggregationNN(torch.nn.Module):
         self.n_groups = len(unique_group_ids)
         self.max_group_size = torch.max(group_sizes)
 
+
         self.kp_mask = torch.zeros(self.n_groups, self.max_group_size, dtype=torch.bool)  # this mask can also be prefilled
         for gid, gs in zip(unique_group_ids, group_sizes):
             # embs[gid, :gs] = tree_preds[group_ids == gid]
             self.kp_mask[gid, gs:] = True
         self.emplacement_ids = tuple(torch.argwhere(~self.kp_mask).T)
         self.instance_sorter = torch.argsort(group_ids)
+        self.inverse_instance_sorter = torch.argsort(self.instance_sorter)
 
     def _raw_attention_logits(self, query, embs):
         """
@@ -73,8 +75,8 @@ class AttentionAggregationNN(torch.nn.Module):
         q = q.reshape(batch_size, target_len, num_heads, head_dim).transpose(1, 2)
         k = k.reshape(batch_size, source_len, num_heads, head_dim).transpose(1, 2)
         logits = torch.matmul(q, k.transpose(-2, -1)) / (head_dim ** 0.5)
-        # store one score per instance, so multi-head logits are averaged.
-        logits = logits.squeeze(2).mean(dim=1)
+        # each head has its own softmax, has its own instance score
+        logits = logits.squeeze(2)
         return logits
 
     def forward(self, tree_preds, group_ids):
@@ -91,10 +93,32 @@ class AttentionAggregationNN(torch.nn.Module):
 
         # Keep raw logits in flattened instance order so ranking loss and
         # downstream inspection use the same per-instance convention.
+        # shape [n_bags, max_bag_size, n_heads]
         padded_attention_logits = self._raw_attention_logits(query, embs)
+
+        # move the instance dimension before the head dimension 
+        # [n_bags, max_bag_size, n_heads]
+        bag_instance_head_logits=padded_attention_logits.permute(0,2,1)
+
+        # select only readl instances, excluding padding 
+        bag_ids, positions=self.emplacement_ids
+
+        # instances are currently ordered by group/bag
+        # shape [n_instances, n_heads]
+        grouped_per_head_logits=bag_instance_head_logits[bag_ids, positions]
+
+        # restore the original flattened instance order
+        per_head_logits=grouped_per_head_logits[self.inverse_instance_sorter]
+
+        # do not detach this tensor, rank loss needs its gradient 
+        self.last_attention_logits_per_head=per_head_logits
+
         attention_logits = torch.empty(len(tree_preds), 1, dtype=tree_preds.dtype, device=tree_preds.device)
         attention_logits[self.instance_sorter] = padded_attention_logits[self.emplacement_ids].reshape((-1, 1))
-        self.last_attention_logits = attention_logits
+        self.last_attention_logits = per_head_logits.mean(
+            dim=1,
+            keepdim=True
+        )
 
         group_embeddings, attention_weights = self.attention(
             query,
@@ -273,13 +297,13 @@ class SetTreeNN(TreeNN):
         return torch.isfinite(labels) & (labels >= 0.0)
 
     def __rank_loss(self, cur_X_torch):
-        """Pairwise rank loss on raw attention logits inside each bag.
+        """Pairwise rank loss on raw attention logits inside each bag and each attention logit
 
         Only annotated positive-negative pairs contribute. Within each bag we
         average over available pairs so a densely annotated bag does not
         dominate the ranking signal.
         """
-        scores = getattr(self.nn_, 'last_attention_logits', None)
+        scores = getattr(self.nn_, 'last_attention_logits_per_head', None)
         if scores is None:
             return None
         labels = self.__aligned_instance_labels(scores, cur_X_torch)
@@ -287,33 +311,35 @@ class SetTreeNN(TreeNN):
             return None
 
         group_ids = cur_X_torch.ravel().to(device=scores.device, dtype=torch.long)
+
         losses = []
+
+        # ranking loss in each bag
         for gid in torch.unique(group_ids):
             group_mask = group_ids == gid
+
+            # shape [bag_size, n_heads]
             group_scores = scores[group_mask]
             group_labels = labels[group_mask]
             valid_labels = self.__valid_instance_label_mask(group_labels)
-            for output_id in range(group_scores.shape[1]):
-                output_valid = valid_labels[:, output_id]
-                output_labels = group_labels[:, output_id]
-                # embryo label [0, 1] -> 0: negative, 1: positive, inbetween: soft label when the number of embryos transferred (n) is smaller than the number of live birth (m) m/n
-                # output_label: calssifies the embryos with soft labels as negative !!!!
-                # "improvement": make use of the soft labels 
-                # pos_scores = group_scores[output_valid & (output_labels > 0.5), output_id]
-                # neg_scores = group_scores[output_valid & (output_labels <= 0.5), output_id]
 
-                # if len(pos_scores) == 0 or len(neg_scores) == 0:
-                #     continue
-                # panelize cases where positive attention logits are not higher than negative attention logist by a margin
-                # diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
-                # losses.append(torch.nn.functional.softplus(-diffs).mean())
-
-                # example
+            head_losses=[]
+            for head_id in range(group_scores.shape[1]):
+                output_valid = valid_labels[:, head_id]
+                
+                # there must be at least two annotated instances 
+                if output_valid.sum() < 2:
+                    continue
+                
+                # example (ranking loss in each head)
                 # label 1.0 should rank above label 0.67
                 # label 0.67 should rank above label 0.33
                 # label 0.33 should rank above label 0.0
-                valid_scores=group_scores[output_valid, output_id]
-                valid_y=output_labels[output_valid]
+                valid_scores=group_scores[output_valid, head_id]
+                valid_y=group_labels[output_valid, head_id]
+
+                # pair_mask[i, j] is True, when instance i should rank above instance j
+                label_diff = valid_y[:, None] - valid_y[None, :]
 
                 # # pairwise label difference 
                 label_diff=valid_y[:, None] - valid_y[None, :]
@@ -321,20 +347,26 @@ class SetTreeNN(TreeNN):
                 # # embryo i should rank above embryo j if lable_i > label_j
                 pair_mask=label_diff>0
 
-                if pair_mask.sum()==0:
-                    continue 
+                if not torch.any(pair_mask):
+                    continue
 
-                score_diff=valid_scores[:, None] - valid_scores[None, :]
+                score_diff=(
+                    valid_scores[:, None] 
+                    - valid_scores[None, :]
+                    )
 
                 diffs=score_diff[pair_mask]-self.rank_loss_margin
 
                 pair_losses=torch.nn.functional.softplus(-diffs)
 
-                losses.append(pair_losses.mean())
+                head_losses.append(pair_losses.mean())
+            
+            if head_losses:
+                losses.append(torch.stack(head_losses).mean())
 
         if len(losses) == 0:
             return scores.new_zeros(())
-        return torch.stack(losses).sum()
+        return torch.stack(losses).mean()
 
     def __instance_loss(self, cur_X_torch):
         scores = getattr(self.nn_, 'last_attention_logits', None)
