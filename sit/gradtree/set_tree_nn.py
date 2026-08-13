@@ -299,11 +299,11 @@ class SetTreeNN(TreeNN):
                 # embryo label [0, 1] -> 0: negative, 1: positive, inbetween: soft label when the number of embryos transferred (n) is smaller than the number of live birth (m) m/n
                 # output_label: calssifies the embryos with soft labels as negative !!!!
                 # "improvement": make use of the soft labels 
-                pos_scores = group_scores[output_valid & (output_labels > 0.5), output_id]
-                neg_scores = group_scores[output_valid & (output_labels <= 0.5), output_id]
+                # pos_scores = group_scores[output_valid & (output_labels > 0.5), output_id]
+                # neg_scores = group_scores[output_valid & (output_labels <= 0.5), output_id]
 
-                if len(pos_scores) == 0 or len(neg_scores) == 0:
-                    continue
+                # if len(pos_scores) == 0 or len(neg_scores) == 0:
+                #     continue
                 # panelize cases where positive attention logits are not higher than negative attention logist by a margin
                 # diffs = pos_scores[:, None] - neg_scores[None, :] - self.rank_loss_margin
                 # losses.append(torch.nn.functional.softplus(-diffs).mean())
@@ -357,6 +357,7 @@ class SetTreeNN(TreeNN):
 
     def __add_auxiliary_losses(self, bag_loss, cur_X_torch):
         """Attach optional rank / instance supervision to the bag loss."""
+        # rank loss weight is between 0-1 and is used to balance the bag loss and rank loss
         loss = bag_loss
         if self.rank_loss_weight:
             rank_loss = self.__rank_loss(cur_X_torch)
