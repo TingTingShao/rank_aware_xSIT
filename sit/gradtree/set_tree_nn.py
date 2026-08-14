@@ -588,17 +588,11 @@ class SetTreeNN(TreeNN):
 
         rank_weight = self.rank_loss_weight
         instance_weight = self.instance_loss_weight
-        bag_weight = 1.0 - rank_weight - instance_weight
 
         if rank_weight < 0.0 or instance_weight < 0.0:
             raise ValueError("Loss weights must be non-negative")
 
-        if bag_weight < 0.0:
-            raise ValueError(
-                "rank_loss_weight + instance_loss_weight must be <= 1"
-            )
-
-        loss = bag_weight * bag_loss
+        loss =  bag_loss
 
         if rank_weight:
             rank_loss = self.__rank_loss(cur_X_torch)
